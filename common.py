@@ -1,217 +1,283 @@
 #!/usr/bin/env python3
+"""
+common.py - Lớp Router, hàm chung, sysctl, FRR helpers cho dự án Metro Ethernet MPLS.
+
+Tất cả module khác import từ đây để đảm bảo nhất quán.
+"""
+
 import os
-import shutil
 import subprocess
 import time
-from pathlib import Path
+import datetime
 
-from mininet.log import info
 from mininet.node import Node
+from mininet.log import info, error
 
-BASE_DIR = Path("/tmp/metro_mpls")
-DEFAULT_MTU = 1600
-FRR_DIR_CANDIDATES = ["/usr/lib/frr", "/usr/libexec/frr", "/usr/sbin", "/usr/bin"]
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────────────────────────────────────
+FRR_ZEBRA   = '/usr/lib/frr/zebra'
+FRR_OSPFD   = '/usr/lib/frr/ospfd'
+FRR_LDPD    = '/usr/lib/frr/ldpd'
+FRR_USER    = 'frr'
+FRR_GROUP   = 'frr'
 
-
-def daemon_bin(name: str) -> str:
-    for d in FRR_DIR_CANDIDATES:
-        p = Path(d) / name
-        if p.exists():
-            return str(p)
-    return name
-
-
-def host_cmd(cmd: str) -> str:
-    return subprocess.run(
-        cmd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-    ).stdout
+MPLS_PLATFORM_LABELS = 100000   # đủ lớn cho LDP label pool
+MTU_BACKBONE         = 1512     # tránh drop khi gói MPLS/VPLS mang thêm header
+OSPF_WAIT_SEC        = 45       # giây chờ OSPF hội tụ sau khi bật
+LDP_WAIT_SEC         = 15       # giây chờ LDP thiết lập LSP sau OSPF
 
 
-def cleanup_all():
-    info("*** Cleanup Mininet/FRR state\n")
-    host_cmd("mn -c >/dev/null 2>&1 || true")
-    host_cmd("pkill -9 zebra >/dev/null 2>&1 || true")
-    host_cmd("pkill -9 ospfd >/dev/null 2>&1 || true")
-    host_cmd("pkill -9 ldpd >/dev/null 2>&1 || true")
-    host_cmd("pkill -9 staticd >/dev/null 2>&1 || true")
-    host_cmd("pkill -9 watchfrr >/dev/null 2>&1 || true")
-    if BASE_DIR.exists():
-        shutil.rmtree(BASE_DIR, ignore_errors=True)
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
+# ──────────────────────────────────────────────────────────────────────────────
+# BASE ROUTER CLASS  (CE / PE / P)
+# ──────────────────────────────────────────────────────────────────────────────
+class LinuxRouter(Node):
+    """
+    Node Linux hoạt động như Router: bật ip_forward, cài sẵn sysctl MPLS.
+    FRR daemon (zebra, ospfd, ldpd) được khởi động riêng bởi hàm start_frr_*
+    để tránh race condition khi dựng topo.
+    """
 
-
-def load_mpls_kernel():
-    info("*** Loading MPLS kernel modules\n")
-    host_cmd("modprobe mpls_router || true")
-    host_cmd("modprobe mpls_iptunnel || true")
-    host_cmd("sysctl -w net.mpls.platform_labels=100000 >/dev/null")
-    host_cmd("sysctl -w net.mpls.conf.lo.input=1 >/dev/null")
-
-
-def wait_msg(seconds: int, msg: str):
-    info(f"*** {msg} ({seconds}s)\n")
-    time.sleep(seconds)
-
-
-def run_dir(node_name: str) -> Path:
-    p = BASE_DIR / node_name
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-
-def write_file(path: Path, content: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-class LinuxMPLSRouter(Node):
     def config(self, **params):
         super().config(**params)
-        self.cmd("sysctl -w net.ipv4.ip_forward=1 >/dev/null")
-        self.cmd("sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null")
-        self.cmd("sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null")
-        self.cmd("sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null")
-        self.cmd("sysctl -w net.mpls.platform_labels=100000 >/dev/null")
-        self.cmd("sysctl -w net.mpls.conf.lo.input=1 >/dev/null")
-        self.cmd("modprobe mpls_router 2>/dev/null || true")
-        self.cmd("modprobe mpls_iptunnel 2>/dev/null || true")
+        # ip forwarding – bắt buộc
+        self.cmd('sysctl -w net.ipv4.ip_forward=1')
+        # MPLS kernel – bắt buộc trước khi gán nhãn
+        self.cmd(f'sysctl -w net.mpls.platform_labels={MPLS_PLATFORM_LABELS}')
+        # ECMP multipath – cần cho CN3 leaf-spine và cả backbone
+        self.cmd('sysctl -w net.ipv4.fib_multipath_hash_policy=1')
+        # Tắt rp_filter để tránh drop gói asymmetric
+        self.cmd('for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $f; done')
+        # Tạo thư mục cấu hình FRR riêng cho từng node
+        self.cmd(f'mkdir -p /tmp/{self.name} && chmod 777 /tmp/{self.name}')
 
     def terminate(self):
-        rd = run_dir(self.name)
-        for pidf in ["zebra.pid", "ospfd.pid", "ldpd.pid", "staticd.pid"]:
-            p = rd / pidf
-            if p.exists():
-                try:
-                    self.cmd(f"kill -9 $(cat {p}) >/dev/null 2>&1 || true")
-                except Exception:
-                    pass
+        # Dọn tiến trình FRR khi tắt
+        self.cmd(f'kill $(cat /tmp/{self.name}/zebra.pid 2>/dev/null) 2>/dev/null')
+        self.cmd(f'kill $(cat /tmp/{self.name}/ospfd.pid 2>/dev/null) 2>/dev/null')
+        self.cmd(f'kill $(cat /tmp/{self.name}/ldpd.pid 2>/dev/null) 2>/dev/null')
         super().terminate()
 
 
-class RouterCE(LinuxMPLSRouter):
-    pass
+# ──────────────────────────────────────────────────────────────────────────────
+# MODPROBE MPLS KERNEL MODULES
+# ──────────────────────────────────────────────────────────────────────────────
+def load_mpls_modules():
+    """Nạp module kernel MPLS. Gọi TRƯỚC khi dựng topo."""
+    info('*** Loading MPLS kernel modules...\n')
+    for mod in ['mpls_router', 'mpls_iptunnel']:
+        ret = subprocess.run(['modprobe', mod], capture_output=True)
+        if ret.returncode != 0:
+            error(f'[WARN] modprobe {mod} failed (maybe already loaded): {ret.stderr.decode()}\n')
+        else:
+            info(f'    modprobe {mod} OK\n')
 
 
-class RouterPE(LinuxMPLSRouter):
-    pass
+# ──────────────────────────────────────────────────────────────────────────────
+# MININET CLEANUP
+# ──────────────────────────────────────────────────────────────────────────────
+def cleanup_mininet():
+    """Chạy mn -c và kill các tiến trình FRR còn thừa."""
+    info('*** Cleaning up previous Mininet state...\n')
+    subprocess.run(['sudo', 'mn', '-c'], capture_output=True, timeout=30)
+    subprocess.run(['sudo', 'killall', '-9', 'zebra', 'ospfd', 'ldpd'],
+                   capture_output=True)
+    time.sleep(1)
 
 
-class RouterP(LinuxMPLSRouter):
-    pass
+# ──────────────────────────────────────────────────────────────────────────────
+# FRR DAEMON HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+def _write_base_conf(node_name: str, extra: str = '') -> str:
+    """Tạo file cấu hình zebra.conf cơ bản và trả về đường dẫn conf_dir."""
+    conf_dir = f'/tmp/{node_name}'
+    os.makedirs(conf_dir, exist_ok=True)
+    base = (
+        f'hostname {node_name}\n'
+        'log stdout\n'
+        'service advanced-vty\n'
+        '!\n'
+        'line vty\n'
+        ' no login\n'
+        '!\n'
+    ) + extra
+    path = f'{conf_dir}/zebra.conf'
+    with open(path, 'w') as f:
+        f.write(base)
+    # vtysh.conf: tìm đúng socket trong conf_dir
+    vtysh_conf = f'{conf_dir}/vtysh.conf'
+    with open(vtysh_conf, 'w') as f:
+        f.write(f'service integrated-vtysh-config\nhostname {node_name}\n')
+    # Cấp quyền cho frr nếu user tồn tại
+    try:
+        subprocess.run(['chown', '-R', f'{FRR_USER}:{FRR_GROUP}', conf_dir],
+                       capture_output=True)
+    except Exception:
+        pass  # Bỏ qua nếu user frr không tồn tại
+    return conf_dir
 
 
-def ensure_netns_links(net):
-    os.makedirs("/var/run/netns", exist_ok=True)
-    for name, node in net.nameToNode.items():
-        if hasattr(node, "pid") and node.pid:
-            host_cmd(f"ln -sf /proc/{node.pid}/ns/net /var/run/netns/{name}")
-
-
-def set_link_up(node, intf: str, mtu: int = DEFAULT_MTU):
-    node.cmd(f"ip link set dev {intf} up")
-    node.cmd(f"ip link set dev {intf} mtu {mtu}")
-
-
-def add_ip(node, intf: str, cidr: str):
-    node.cmd(f"ip addr flush dev {intf}")
-    node.cmd(f"ip addr add {cidr} dev {intf}")
-    node.cmd(f"ip link set dev {intf} up")
-
-
-def add_loopback(node, cidr: str):
-    node.cmd("ip addr flush dev lo")
-    node.cmd("ip addr add 127.0.0.1/8 dev lo")
-    node.cmd(f"ip addr add {cidr} dev lo")
-    node.cmd("ip link set dev lo up")
-    node.cmd("sysctl -w net.mpls.conf.lo.input=1 >/dev/null")
-
-
-def add_vlan_subif(node, parent: str, vlan: int, ip_cidr: str = None, mtu: int = DEFAULT_MTU) -> str:
-    subif = f"{parent}.{vlan}"
-    node.cmd(f"ip link add link {parent} name {subif} type vlan id {vlan} 2>/dev/null || true")
-    node.cmd(f"ip link set dev {subif} mtu {mtu}")
-    node.cmd(f"ip link set dev {subif} up")
-    if ip_cidr:
-        node.cmd(f"ip addr flush dev {subif}")
-        node.cmd(f"ip addr add {ip_cidr} dev {subif}")
-    return subif
-
-
-def add_bridge(node, br: str, members=None, ip_cidr: str = None, mtu: int = DEFAULT_MTU):
-    members = members or []
-    node.cmd(f"ip link add name {br} type bridge 2>/dev/null || true")
-    node.cmd(f"ip link set dev {br} mtu {mtu}")
-    node.cmd(f"ip link set dev {br} up")
-    for m in members:
-        node.cmd(f"ip addr flush dev {m}")
-        node.cmd(f"ip link set dev {m} up")
-        node.cmd(f"ip link set dev {m} master {br}")
-    if ip_cidr:
-        node.cmd(f"ip addr flush dev {br}")
-        node.cmd(f"ip addr add {ip_cidr} dev {br}")
-
-
-def add_route(node, prefix: str, via: str = None, dev: str = None):
-    if via and dev:
-        node.cmd(f"ip route replace {prefix} via {via} dev {dev}")
-    elif via:
-        node.cmd(f"ip route replace {prefix} via {via}")
-    elif dev:
-        node.cmd(f"ip route replace {prefix} dev {dev}")
-
-
-def enable_mpls_on_interfaces(node, interfaces):
-    for intf in interfaces:
-        node.cmd(f"sysctl -w net.mpls.conf.{intf}.input=1 >/dev/null")
-
-
-def start_frr(node, daemons=("zebra", "ospfd", "ldpd")):
-    rd = run_dir(node.name)
-    base = f"hostname {node.name}\nlog file {rd}/frr.log\nservice integrated-vtysh-config\n!\n"
-    for d in daemons:
-        write_file(rd / f"{d}.conf", base)
-
-    zebra = daemon_bin("zebra")
-    ospfd = daemon_bin("ospfd")
-    ldpd = daemon_bin("ldpd")
-    staticd = daemon_bin("staticd")
-
-    node.cmd(f"{zebra} -d -f {rd/'zebra.conf'} -z {rd/'zserv.api'} -i {rd/'zebra.pid'} -A 127.0.0.1")
+def start_frr_zebra(node):
+    """
+    Khởi động zebra daemon trong network namespace của node.
+    Dùng node.cmd() để chạy TRONG netns (giống Mininet thiết kế).
+    """
+    conf_dir = _write_base_conf(node.name)
+    node.cmd(
+        f'{FRR_ZEBRA} -d -u {FRR_USER} -g {FRR_GROUP} -A 127.0.0.1 '
+        f'-f {conf_dir}/zebra.conf -i {conf_dir}/zebra.pid '
+        f'> {conf_dir}/zebra.log 2>&1 || '
+        # Fallback: chạy không có -u/-g nếu user frr không tồn tại
+        f'{FRR_ZEBRA} -d -A 127.0.0.1 '
+        f'-f {conf_dir}/zebra.conf -i {conf_dir}/zebra.pid '
+        f'>> {conf_dir}/zebra.log 2>&1'
+    )
     time.sleep(0.5)
 
-    if "ospfd" in daemons:
-        node.cmd(f"{ospfd} -d -f {rd/'ospfd.conf'} -z {rd/'zserv.api'} -i {rd/'ospfd.pid'} -A 127.0.0.1")
-        time.sleep(0.3)
 
-    if "ldpd" in daemons:
-        node.cmd(f"{ldpd} -d -f {rd/'ldpd.conf'} -z {rd/'zserv.api'} -i {rd/'ldpd.pid'} -A 127.0.0.1")
-        time.sleep(0.3)
-
-    if "staticd" in daemons:
-        node.cmd(f"{staticd} -d -f {rd/'staticd.conf'} -z {rd/'zserv.api'} -i {rd/'staticd.pid'} -A 127.0.0.1")
-        time.sleep(0.3)
-
-
-def vtysh_apply(node, lines):
-    rd = run_dir(node.name)
-    cfg = "configure terminal\n" + "\n".join(lines) + "\nend\n"
-    cfg_path = rd / "apply.cli"
-    write_file(cfg_path, cfg)
-    return node.cmd(f"vtysh -f {cfg_path}")
-
-
-def interface_exists(node, intf: str) -> bool:
-    out = node.cmd(f"ip link show {intf} 2>/dev/null")
-    return intf in out
+def start_frr_ospfd(node):
+    """Khởi động ospfd daemon trong netns của node."""
+    conf_dir = f'/tmp/{node.name}'
+    ospf_conf = f'{conf_dir}/ospfd.conf'
+    with open(ospf_conf, 'w') as f:
+        f.write(f'hostname {node.name}\nlog stdout\nline vty\n no login\n!\n')
+    try:
+        subprocess.run(['chown', f'{FRR_USER}:{FRR_GROUP}', ospf_conf],
+                       capture_output=True)
+    except Exception:
+        pass
+    node.cmd(
+        f'{FRR_OSPFD} -d -u {FRR_USER} -g {FRR_GROUP} -A 127.0.0.1 '
+        f'-f {ospf_conf} -i {conf_dir}/ospfd.pid '
+        f'> {conf_dir}/ospfd.log 2>&1 || '
+        f'{FRR_OSPFD} -d -A 127.0.0.1 '
+        f'-f {ospf_conf} -i {conf_dir}/ospfd.pid '
+        f'>> {conf_dir}/ospfd.log 2>&1'
+    )
+    time.sleep(0.5)
 
 
-def ovs_access(sw, port_name: str, vlan: int):
-    sw.cmd(f"ovs-vsctl --if-exists clear port {port_name} tag trunks vlan_mode")
-    sw.cmd(f"ovs-vsctl set port {port_name} tag={vlan}")
+def start_frr_ldpd(node):
+    """Khởi động ldpd daemon trong netns của node."""
+    conf_dir = f'/tmp/{node.name}'
+    ldp_conf = f'{conf_dir}/ldpd.conf'
+    with open(ldp_conf, 'w') as f:
+        f.write(f'hostname {node.name}\nlog stdout\nline vty\n no login\n!\n')
+    try:
+        subprocess.run(['chown', f'{FRR_USER}:{FRR_GROUP}', ldp_conf],
+                       capture_output=True)
+    except Exception:
+        pass
+    node.cmd(
+        f'{FRR_LDPD} -d -u {FRR_USER} -g {FRR_GROUP} -A 127.0.0.1 '
+        f'-f {ldp_conf} -i {conf_dir}/ldpd.pid '
+        f'> {conf_dir}/ldpd.log 2>&1 || '
+        f'{FRR_LDPD} -d -A 127.0.0.1 '
+        f'-f {ldp_conf} -i {conf_dir}/ldpd.pid '
+        f'>> {conf_dir}/ldpd.log 2>&1'
+    )
+    time.sleep(0.5)
 
 
-def ovs_trunk(sw, port_name: str, vlans):
-    vl = ",".join(str(v) for v in vlans)
-    sw.cmd(f"ovs-vsctl --if-exists clear port {port_name} tag trunks vlan_mode")
-    sw.cmd(f"ovs-vsctl set port {port_name} vlan_mode=trunk trunks={vl}")
+def vtysh_cmd(node, commands: str) -> str:
+    """
+    Gửi lệnh cấu hình vào FRR vtysh của node (chạy TRONG netns).
+
+    Cách hoạt động:
+    - node.cmd() tự động chạy lệnh trong network namespace của node.
+    - vtysh connect đến socket của các daemon FRR đang chạy trong cùng netns.
+    - Không cần --vty_socket vì daemon và vtysh cùng namespace.
+
+    commands: block lệnh Cisco-style (không cần 'enable', 'conf t' -- tự thêm).
+    """
+    conf_dir  = f'/tmp/{node.name}'
+    # Build full command block
+    lines     = ['enable', 'configure terminal'] + commands.strip().split('\n') + ['end', 'write memory']
+    cmd_block = '\n'.join(lines)
+    # Dùng heredoc để tránh vấn đề escape với ký tự đặc biệt
+    result = node.cmd(
+        f'printf "{cmd_block}\\n" | '
+        f'VTYSH_PAGER=cat vtysh 2>&1'
+    )
+    return result
+
+
+def vtysh_exec(node, cmd_str: str) -> str:
+    """
+    Chạy lệnh show qua vtysh (không cần configure terminal).
+    Ví dụ: show ip ospf neighbor, show mpls ldp neighbor.
+    """
+    return node.cmd(f'VTYSH_PAGER=cat vtysh -c "{cmd_str}" 2>&1')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INTERFACE HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+def set_ip(node, intf: str, ip_cidr: str):
+    """Gán IP cho interface, flush IP cũ trước."""
+    node.cmd(f'ip link set {intf} up')
+    node.cmd(f'ip addr flush dev {intf}')
+    node.cmd(f'ip addr add {ip_cidr} dev {intf}')
+
+
+def add_loopback(node, ip_cidr: str, lo_name: str = 'lo'):
+    """Thêm địa chỉ loopback (dùng làm router-id cho OSPF/LDP)."""
+    node.cmd(f'ip link set {lo_name} up')
+    node.cmd(f'ip addr add {ip_cidr} dev {lo_name} 2>/dev/null || true')
+
+
+def set_mtu(node, intf: str, mtu: int = MTU_BACKBONE):
+    """Tăng MTU tránh drop khi đóng gói MPLS."""
+    node.cmd(f'ip link set {intf} mtu {mtu}')
+
+
+def enable_mpls_on_intf(node, intf: str):
+    """Bật MPLS input trên interface (cần cho LDP forwarding)."""
+    node.cmd(f'sysctl -w net.mpls.conf.{intf}.input=1')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BRIDGE / VPLS HELPERS  (L2 over MPLS fallback)
+# ──────────────────────────────────────────────────────────────────────────────
+def create_linux_bridge(node, br_name: str, interfaces: list):
+    """
+    Tạo Linux bridge (dùng làm bridge-domain cho VPLS fallback).
+    FRR trong Mininet thường không có full VPLS YANG support,
+    nên dùng Linux bridge + GRE/VXLAN tunnel làm Metro Ethernet giả lập.
+    """
+    node.cmd(f'ip link add name {br_name} type bridge 2>/dev/null || true')
+    node.cmd(f'ip link set {br_name} up')
+    for intf in interfaces:
+        node.cmd(f'ip link set {intf} master {br_name}')
+        node.cmd(f'ip link set {intf} up')
+
+
+def create_gre_tunnel(node, tun_name: str, local_ip: str, remote_ip: str,
+                      key: int = 100):
+    """
+    Tạo GRE tunnel point-to-point để mô phỏng pseudowire/VPLS.
+
+    FALLBACK NOTE: FRRouting trong Mininet không hỗ trợ đầy đủ lệnh VPLS
+    (l2vpn evpn / pseudowire-class / xconnect). Thay vào đó, ta dùng
+    GRE key tunnel trên Linux để mô phỏng dịch vụ L2 Metro Ethernet
+    xuyên backbone MPLS. Gói tin vẫn đi qua MPLS LSP (LDP-assigned label)
+    vì GRE endpoint dùng địa chỉ loopback của PE, và các loopback này
+    chỉ reachable qua MPLS/OSPF underlay.
+    """
+    node.cmd(
+        f'ip tunnel add {tun_name} mode gre local {local_ip} '
+        f'remote {remote_ip} key {key} 2>/dev/null || true'
+    )
+    node.cmd(f'ip link set {tun_name} up mtu {MTU_BACKBONE}')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING UTILITY
+# ──────────────────────────────────────────────────────────────────────────────
+def log_msg(msg: str, log_file: str = None):
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f'[{ts}] {msg}'
+    info(line + '\n')
+    if log_file:
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
